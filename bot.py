@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 OWNER_ID = 1343284628
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
 
 # Available models
 MODELS = {
