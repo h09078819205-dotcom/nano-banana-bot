@@ -18,24 +18,19 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 OWNER_ID = 1343284628
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # Available models
 MODELS = {
     "nano2": {
         "name": "🍌 Nano Banana 2",
-        "model": "gemini-3.1-flash-image",
-        "desc": "Быстрая, качественная, до 4K"
+        "model": "gemini-2.5-flash-preview-image-generation",
+        "desc": "Быстрая, качественная"
     },
-    "nano2lite": {
-        "name": "⚡ Nano Banana 2 Lite",
-        "model": "gemini-3.1-flash-lite-image",
-        "desc": "Самая быстрая и дешёвая"
-    },
-    "nanopro": {
-        "name": "🏆 Nano Banana Pro",
-        "model": "gemini-3-pro-image",
-        "desc": "Максимальное качество"
+    "imagen": {
+        "name": "🖼 Imagen 4",
+        "model": "imagen-4.0-generate-preview-06-06",
+        "desc": "Максимальное качество фото"
     },
 }
 
@@ -58,20 +53,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── STATE ────────────────────────────────────────────────────────────
-# user_id -> model key
 user_models = {}
-# user_id -> quality key
 user_qualities = {}
-# user_id -> list of active generation tasks
 active_generations = {}
-# user_id -> cancelled flag
 cancelled_users = set()
-# Store prompts for retry: message_id -> prompt text
 retry_prompts = {}
-# Dedup sets
 processed_messages = set()
 processed_callbacks = set()
-# Access control
 authorized_users = {OWNER_ID}
 ACCESS_CODE = "dino2025"
 
@@ -79,56 +67,63 @@ ACCESS_CODE = "dino2025"
 # ─── HELPERS ──────────────────────────────────────────────────────────
 
 def get_user_model(user_id: int) -> dict:
-    """Get the model config for a user."""
     key = user_models.get(user_id, DEFAULT_MODEL)
     return MODELS[key]
 
 
 def parse_prompts(text: str) -> list:
-    """Parse numbered prompts from text. Supports (1) and 1. formats."""
-    # Try (N) format first
     parts = re.split(r'\(\d+\)\s*', text)
     parts = [p.strip() for p in parts if p.strip()]
     if len(parts) > 1:
         return parts
 
-    # Try N. format
     parts = re.split(r'\d+\.\s+', text)
     parts = [p.strip() for p in parts if p.strip()]
     if len(parts) > 1:
         return parts
 
-    # Single prompt
     return [text.strip()] if text.strip() else []
 
 
 async def generate_image(prompt: str, model_id: str, user_id: int, quality: str = "1K") -> bytes | None:
-    """Call Google Gemini API to generate an image."""
     if user_id in cancelled_users:
         return None
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
+    # Check if using Imagen model
+    is_imagen = "imagen" in model_id
 
-    payload = {
-        "model": model_id,
-        "input": [
-            {"type": "text", "text": prompt}
-        ],
-        "response_format": {
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "aspect_ratio": "16:9",
-            "image_size": quality
+    if is_imagen:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:predict"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
         }
-    }
+        payload = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "aspectRatio": "16:9",
+                "sampleCount": 1
+            }
+        }
+    else:
+        url = GEMINI_API_URL.format(model=model_id)
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        }
+        payload = {
+            "contents": [{
+                "parts": [{"text": f"Generate an image: {prompt}"}]
+            }],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"]
+            }
+        }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                GEMINI_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
+                url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -137,21 +132,24 @@ async def generate_image(prompt: str, model_id: str, user_id: int, quality: str 
 
                 data = await resp.json()
 
-                # Extract image from response steps
-                for step in data.get("steps", []):
-                    if step.get("type") == "model_output":
-                        for block in step.get("content", []):
-                            if block.get("type") == "image":
-                                image_data = block.get("data", "")
-                                if image_data:
-                                    return base64.b64decode(image_data)
+                if is_imagen:
+                    predictions = data.get("predictions", [])
+                    if predictions:
+                        b64 = predictions[0].get("bytesBase64Encoded", "")
+                        if b64:
+                            return base64.b64decode(b64)
+                else:
+                    candidates = data.get("candidates", [])
+                    for candidate in candidates:
+                        content = candidate.get("content", {})
+                        parts = content.get("parts", [])
+                        for part in parts:
+                            if "inlineData" in part:
+                                b64 = part["inlineData"].get("data", "")
+                                if b64:
+                                    return base64.b64decode(b64)
 
-                # Try output_image shortcut
-                output_image = data.get("output_image", {})
-                if output_image and output_image.get("data"):
-                    return base64.b64decode(output_image["data"])
-
-                logger.error(f"No image in Gemini response: {json.dumps(data)[:500]}")
+                logger.error(f"No image in response: {json.dumps(data)[:500]}")
                 return None
 
     except asyncio.TimeoutError:
@@ -168,16 +166,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id not in authorized_users:
-        await update.message.reply_text(
-            "🔒 Введи код доступа для активации бота:"
-        )
+        await update.message.reply_text("🔒 Введи код доступа для активации бота:")
         return
 
     await update.message.reply_text(
         "🦕 *Nano Banana Dino Generator*\n\n"
         "Отправь промпт — получи картинку!\n\n"
         "📝 Один промпт = одна картинка\n"
-        "📄 Отправь .txt файл с нумерованными промптами для пакетной генерации\n\n"
+        "📄 Отправь .txt файл с промптами для пакетной генерации\n\n"
         "Команды:\n"
         "/models — выбрать модель\n"
         "/quality — выбрать качество (1K/2K/4K)\n"
@@ -215,7 +211,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Текущая модель: {model['name']}\n"
         f"Качество: {quality}\n"
         f"Формат: 16:9\n"
-        f"API: Google Gemini (Nano Banana)\n\n"
+        f"API: Google Gemini\n\n"
         "Создано для канала про динозавров 🦖",
         parse_mode="Markdown"
     )
@@ -224,7 +220,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in authorized_users:
-        await update.message.reply_text("🔒 Бот не активирован. Отправь код доступа.")
+        await update.message.reply_text("🔒 Бот не активирован.")
         return
 
     current = user_models.get(user_id, DEFAULT_MODEL)
@@ -246,7 +242,7 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in authorized_users:
-        await update.message.reply_text("🔒 Бот не активирован. Отправь код доступа.")
+        await update.message.reply_text("🔒 Бот не активирован.")
         return
 
     current = user_qualities.get(user_id, DEFAULT_QUALITY)
@@ -260,9 +256,7 @@ async def cmd_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🖼 *Выбери качество изображения:*\n\n"
-        "1K — быстрее, меньше расход\n"
-        "2K — выше детализация\n"
-        "4K — максимальное качество (медленнее)",
+        "1K — быстрее\n2K — выше детализация\n4K — максимум (медленнее)",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
@@ -292,31 +286,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # Model selection
     if data.startswith("model:"):
         model_key = data.split(":", 1)[1]
         if model_key in MODELS:
             user_models[user_id] = model_key
             model = MODELS[model_key]
             await query.answer(f"Выбрана: {model['name']}")
-            await query.edit_message_text(
-                f"✅ Модель: {model['name']}\n{model['desc']}"
-            )
+            await query.edit_message_text(f"✅ Модель: {model['name']}\n{model['desc']}")
         return
 
-    # Quality selection
     if data.startswith("quality:"):
         quality_key = data.split(":", 1)[1]
         if quality_key in QUALITIES:
             user_qualities[user_id] = quality_key
             quality = QUALITIES[quality_key]
             await query.answer(f"Качество: {quality['name']}")
-            await query.edit_message_text(
-                f"✅ Качество: {quality['name']}"
-            )
+            await query.edit_message_text(f"✅ Качество: {quality['name']}")
         return
 
-    # Retry generation
     if data.startswith("retry:"):
         msg_id = data.split(":", 1)[1]
         prompt = retry_prompts.get(msg_id)
@@ -328,28 +315,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         model_config = get_user_model(user_id)
         quality = user_qualities.get(user_id, DEFAULT_QUALITY)
         status_msg = await query.message.reply_text(
-            f"🎨 Генерирую повтор...\n📋 Модель: {model_config['name']} | Качество: {quality}"
+            f"🎨 Генерирую повтор...\n📋 {model_config['name']} | {quality}"
         )
 
         image_data = await generate_image(prompt, model_config["model"], user_id, quality)
         if image_data:
             retry_key = str(status_msg.message_id)
             retry_prompts[retry_key] = prompt
-
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Ещё раз", callback_data=f"retry:{retry_key}")
             ]])
-
-            await query.message.reply_photo(
-                photo=BytesIO(image_data),
-                reply_markup=keyboard
-            )
+            await query.message.reply_photo(photo=BytesIO(image_data), reply_markup=keyboard)
             await status_msg.delete()
         else:
-            await status_msg.edit_text("❌ Ошибка генерации. Попробуй ещё раз.")
+            await status_msg.edit_text("❌ Ошибка генерации.")
         return
 
-    # Cleanup old callbacks
     if len(processed_callbacks) > 5000:
         processed_callbacks.clear()
 
@@ -364,12 +345,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     processed_messages.add(message_id)
 
-    # Access code check
     if user_id not in authorized_users:
         if update.message.text.strip() == ACCESS_CODE:
             authorized_users.add(user_id)
             await update.message.reply_text("✅ Доступ активирован! Отправляй промпты.")
-            # Notify owner
             if user_id != OWNER_ID:
                 try:
                     user = update.effective_user
@@ -382,7 +361,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             return
         else:
-            await update.message.reply_text("🔒 Неверный код. Попробуй ещё раз.")
+            await update.message.reply_text("🔒 Неверный код.")
             return
 
     text = update.message.text.strip()
@@ -402,7 +381,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     processed_messages.add(message_id)
 
     if user_id not in authorized_users:
-        await update.message.reply_text("🔒 Бот не активирован. Отправь код доступа.")
+        await update.message.reply_text("🔒 Бот не активирован.")
         return
 
     doc = update.message.document
@@ -420,7 +399,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompts = parse_prompts(text)
     if not prompts:
-        await update.message.reply_text("❌ Не удалось найти промпты в файле.")
+        await update.message.reply_text("❌ Не удалось найти промпты.")
         return
 
     await process_prompts(update, context, prompts, user_id)
@@ -428,7 +407,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           prompts: list, user_id: int):
-    """Process a list of prompts and generate images."""
     if user_id in cancelled_users:
         cancelled_users.discard(user_id)
 
@@ -438,29 +416,27 @@ async def process_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if total == 1:
         status_msg = await update.message.reply_text(
-            f"🎨 Генерирую...\n📋 Модель: {model_config['name']} | Качество: {quality}"
+            f"🎨 Генерирую...\n📋 {model_config['name']} | {quality}"
         )
     else:
         status_msg = await update.message.reply_text(
-            f"🎨 Генерирую {total} изображений...\n📋 Модель: {model_config['name']} | Качество: {quality}\n"
+            f"🎨 Генерирую {total} изображений...\n📋 {model_config['name']} | {quality}\n"
             f"Для отмены: /cancel"
         )
 
     success = 0
-    errors = 0
+    errors_count = 0
 
     for i, prompt in enumerate(prompts):
         if user_id in cancelled_users:
             cancelled_users.discard(user_id)
-            await status_msg.edit_text(
-                f"🛑 Остановлено. Сгенерировано: {success}/{total}"
-            )
+            await status_msg.edit_text(f"🛑 Остановлено. Сгенерировано: {success}/{total}")
             return
 
         if total > 1:
             try:
                 await status_msg.edit_text(
-                    f"🎨 Генерирую {i+1}/{total}...\n📋 Модель: {model_config['name']} | Качество: {quality}"
+                    f"🎨 Генерирую {i+1}/{total}...\n📋 {model_config['name']} | {quality}"
                 )
             except Exception:
                 pass
@@ -470,26 +446,22 @@ async def process_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if image_data:
             retry_key = f"{update.message.message_id}_{i}"
             retry_prompts[retry_key] = prompt
-
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Ещё раз", callback_data=f"retry:{retry_key}")
             ]])
-
             caption = f"({i+1})" if total > 1 else None
             await update.message.reply_photo(
-                photo=BytesIO(image_data),
-                caption=caption,
-                reply_markup=keyboard
+                photo=BytesIO(image_data), caption=caption, reply_markup=keyboard
             )
             success += 1
         else:
-            errors += 1
+            errors_count += 1
             await update.message.reply_text(f"❌ Ошибка генерации ({i+1})")
 
     if total > 1:
         await status_msg.edit_text(
             f"✅ Готово! Успешно: {success}/{total}"
-            + (f", ошибок: {errors}" if errors else "")
+            + (f", ошибок: {errors_count}" if errors_count else "")
         )
     else:
         try:
@@ -497,7 +469,6 @@ async def process_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception:
             pass
 
-    # Cleanup
     if len(processed_messages) > 5000:
         processed_messages.clear()
     if len(retry_prompts) > 2000:
@@ -507,7 +478,6 @@ async def process_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # ─── MAIN ─────────────────────────────────────────────────────────────
 
 async def post_init(application):
-    """Set bot commands after startup."""
     commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("help", "Помощь"),
@@ -534,21 +504,14 @@ def main():
         .build()
     )
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("quality", cmd_quality))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("about", cmd_about))
-
-    # Callbacks (model selection, retry)
     app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Text messages (prompts)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Documents (txt files)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     logger.info("🦕 Bot started!")
