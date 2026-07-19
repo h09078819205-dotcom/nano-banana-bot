@@ -24,7 +24,7 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 MODELS = {
     "nano2": {
         "name": "🍌 Nano Banana 2",
-        "model": "gemini-2.5-flash-preview-image-generation",
+        "model": "gemini-2.5-gemini-2.5-flash-image",
         "desc": "Быстрая, качественная"
     },
     "imagen": {
